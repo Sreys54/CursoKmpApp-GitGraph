@@ -89,6 +89,7 @@ kotlin {
             //Ktor
             implementation(libs.ktor.client.core)
             implementation(libs.kotlinx.coroutines.core)
+            implementation(libs.kotlinx.datetime)
             implementation(libs.ktor.serialization)
             implementation(libs.ktor.content.negotiation)
         }

@@ -15,3 +15,8 @@ captures
 !*.xcodeproj/project.xcworkspace/
 !*.xcworkspace/contents.xcworkspacedata
 **/xcshareddata/WorkspaceSettings.xcsettings
+
+# SBOM pipeline
+pipeline/sbom/sbom.json
+pipeline/sbom/graph.json
+pipeline/sbom/.env

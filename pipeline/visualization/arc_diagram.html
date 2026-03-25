@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dependency Arc Diagram — CursoKmpApp-GitGraph</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    /* -----------------------------------------------------------------------
+       Layout & typography
+    ----------------------------------------------------------------------- */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      min-height: 100vh;
+    }
+
+    header {
+      padding: 20px 32px 12px;
+      border-bottom: 1px solid #21262d;
+    }
+    header h1 { font-size: 18px; font-weight: 600; color: #f0f6fc; }
+    header p  { font-size: 13px; color: #8b949e; margin-top: 4px; }
+
+    /* -----------------------------------------------------------------------
+       Controls bar
+    ----------------------------------------------------------------------- */
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      padding: 12px 32px;
+      border-bottom: 1px solid #21262d;
+      flex-wrap: wrap;
+    }
+
+    .control-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: #8b949e;
+    }
+    .control-group label { white-space: nowrap; }
+    .control-group strong { color: #e6edf3; min-width: 24px; display: inline-block; }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 160px;
+      height: 4px;
+      background: #30363d;
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 14px; height: 14px;
+      background: #58a6ff;
+      border-radius: 50%;
+    }
+
+    #stats {
+      font-size: 12px;
+      color: #8b949e;
+      margin-left: auto;
+    }
+    #stats span { color: #58a6ff; font-weight: 600; }
+
+    /* -----------------------------------------------------------------------
+       Legend
+    ----------------------------------------------------------------------- */
+    #legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 10px 32px;
+      border-bottom: 1px solid #21262d;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: #8b949e;
+    }
+    .legend-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    /* -----------------------------------------------------------------------
+       Diagram area (horizontally scrollable)
+    ----------------------------------------------------------------------- */
+    #diagram-wrapper {
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding: 0 32px;
+      cursor: default;
+    }
+
+    /* Arc paths */
+    .arc {
+      fill: none;
+      stroke-opacity: 0.25;
+      transition: stroke-opacity 0.15s;
+    }
+    .arc.highlighted   { stroke-opacity: 0.9; }
+    .arc.dimmed        { stroke-opacity: 0.03; }
+
+    /* Node circles */
+    .node {
+      cursor: pointer;
+      transition: r 0.1s;
+    }
+    .node.dimmed { opacity: 0.2; }
+
+    /* Node labels */
+    .node-label {
+      font-size: 9px;
+      fill: #8b949e;
+      pointer-events: none;
+      transition: opacity 0.15s;
+    }
+    .node-label.dimmed    { opacity: 0.1; }
+    .node-label.prominent { fill: #f0f6fc; font-size: 10px; }
+
+    /* -----------------------------------------------------------------------
+       Tooltip
+    ----------------------------------------------------------------------- */
+    #tooltip {
+      position: fixed;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 12px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.1s;
+      max-width: 320px;
+      line-height: 1.6;
+      z-index: 100;
+    }
+    #tooltip .tip-name    { font-weight: 600; color: #f0f6fc; word-break: break-all; }
+    #tooltip .tip-version { color: #58a6ff; }
+    #tooltip .tip-eco     { color: #8b949e; font-size: 11px; margin-top: 2px; }
+    #tooltip .tip-degree  { color: #3fb950; margin-top: 4px; }
+
+    /* -----------------------------------------------------------------------
+       Empty state
+    ----------------------------------------------------------------------- */
+    #empty {
+      display: none;
+      padding: 48px 32px;
+      color: #8b949e;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Dependency Arc Diagram — CursoKmpApp-GitGraph</h1>
+  <p>SPDX 2.3 SBOM · Maven ecosystem · KMP (Android + iOS)</p>
+</header>
+
+<!-- Controls ---------------------------------------------------------------->
+<div id="controls">
+  <div class="control-group">
+    <label>Min. degree</label>
+    <input type="range" id="min-degree" min="1" max="50" value="10" step="1" />
+    <strong id="min-degree-val">10</strong>
+  </div>
+
+  <div class="control-group">
+    <label>Sort by</label>
+    <select id="sort-by" style="background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:3px 6px;font-size:12px;cursor:pointer;">
+      <option value="degree">Degree (hub in center)</option>
+      <option value="ecosystem">Ecosystem</option>
+      <option value="name">Name (A–Z)</option>
+    </select>
+  </div>
+
+  <div id="stats">
+    Showing <span id="stat-nodes">–</span> nodes · <span id="stat-links">–</span> edges
+  </div>
+</div>
+
+<!-- Legend ------------------------------------------------------------------>
+<div id="legend"></div>
+
+<!-- Diagram ----------------------------------------------------------------->
+<div id="diagram-wrapper">
+  <svg id="diagram"></svg>
+</div>
+<div id="empty">No packages match the current filter. Lower the minimum degree.</div>
+
+<!-- Tooltip ----------------------------------------------------------------->
+<div id="tooltip"></div>
+
+<!-- =========================================================================
+     D3 Script
+========================================================================== -->
+<script>
+// ---------------------------------------------------------------------------
+// 0. Constants
+// ---------------------------------------------------------------------------
+
+const NODE_R        = 4;      // base node radius (px)
+const NODE_R_LARGE  = 6;      // radius for high-degree nodes
+const LABEL_THRESH  = 30;     // show label permanently if degree >= this
+const NODE_SPACING  = 14;     // px between nodes along the x-axis
+const ARC_SCALE     = 0.45;   // arc height = distance * this factor (< 0.5 = stays within half-circle)
+const BASELINE_Y    = 280;    // y-position of the node baseline within the SVG
+const SVG_HEIGHT    = 480;    // total SVG height (arcs go above baseline; labels below)
+const MARGIN        = { left: 40, right: 40 };
+
+// ---------------------------------------------------------------------------
+// 1. Ecosystem extraction & color scale
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the top-level group prefix from a node ID.
+ * Examples:
+ *   "org.jetbrains.kotlin:kotlin-stdlib@1.9.23"  → "org.jetbrains"
+ *   "androidx.compose.ui:ui@1.6.1"               → "androidx.compose"
+ *   "com.github.Sreys54/CursoKmpApp-GitGraph@main" → "project root"
+ */
+function getEcosystem(id) {
+  if (id.startsWith("com.github.")) return "project root";
+  const group = id.split(":")[0];                 // "org.jetbrains.kotlin"
+  const parts = group.split(".");
+  return parts.length >= 2 ? parts.slice(0, 2).join(".") : parts[0];
+}
+
+// Fixed palette mapped to known ecosystems in this repo
+const ECOSYSTEM_COLORS = {
+  "project root":    "#f78166",   // red   — the repo itself
+  "org.jetbrains":   "#58a6ff",   // blue  — Kotlin / Compose
+  "io.ktor":         "#3fb950",   // green — Ktor
+  "androidx.compose":"#d2a8ff",   // violet — Jetpack Compose
+  "com.android":     "#ffa657",   // orange — Android tooling
+  "androidx.lifecycle":"#79c0ff", // light blue
+  "co.touchlab":     "#f0883e",   // amber
+  "com.google":      "#ff7b72",   // coral
+  "moe.tlaster":     "#56d364",   // lime
+  "other":           "#8b949e",   // gray
+};
+
+function colorOf(id) {
+  const eco = getEcosystem(id);
+  return ECOSYSTEM_COLORS[eco] || ECOSYSTEM_COLORS["other"];
+}
+
+// ---------------------------------------------------------------------------
+// 2. Load graph.json and boot
+// ---------------------------------------------------------------------------
+
+/**
+ * graph.json lives one directory up (../sbom/graph.json).
+ * Both files are served from the same origin, so fetch works fine.
+ */
+fetch("../sbom/graph.json")
+  .then(r => {
+    if (!r.ok) throw new Error(`HTTP ${r.status} — could not load graph.json`);
+    return r.json();
+  })
+  .then(data => boot(data))
+  .catch(err => {
+    document.getElementById("diagram-wrapper").innerHTML =
+      `<p style="color:#f78166;padding:32px">
+        Error loading graph.json: ${err.message}<br>
+        <small>Make sure you are serving the files from a local HTTP server (see README).</small>
+       </p>`;
+  });
+
+// ---------------------------------------------------------------------------
+// 3. Main function — called once after graph.json loads
+// ---------------------------------------------------------------------------
+
+function boot(data) {
+
+  // ── 3a. Pre-compute degree for every node ────────────────────────────────
+  //
+  // "degree" = number of direct connections (both as source and target).
+  // We use this to:
+  //   • Filter nodes shown (min-degree slider)
+  //   • Sort node order on the axis
+  //   • Size nodes (larger circle = more connections)
+
+  const degree = {};
+  data.nodes.forEach(n => { degree[n.id] = 0; });
+  data.links.forEach(l => {
+    degree[l.source] = (degree[l.source] || 0) + 1;
+    degree[l.target] = (degree[l.target] || 0) + 1;
+  });
+
+  // ── 3b. Build legend ─────────────────────────────────────────────────────
+
+  const legendDiv = document.getElementById("legend");
+  Object.entries(ECOSYSTEM_COLORS).forEach(([eco, color]) => {
+    const item = document.createElement("div");
+    item.className = "legend-item";
+    item.innerHTML = `<div class="legend-dot" style="background:${color}"></div>${eco}`;
+    legendDiv.appendChild(item);
+  });
+
+  // ── 3c. Wire up controls ─────────────────────────────────────────────────
+
+  const slider   = document.getElementById("min-degree");
+  const sliderVal= document.getElementById("min-degree-val");
+  const sortSel  = document.getElementById("sort-by");
+
+  slider.addEventListener("input", () => {
+    sliderVal.textContent = slider.value;
+    render(data, degree, +slider.value, sortSel.value);
+  });
+  sortSel.addEventListener("change", () => {
+    render(data, degree, +slider.value, sortSel.value);
+  });
+
+  // ── 3d. Initial render ───────────────────────────────────────────────────
+  render(data, degree, +slider.value, sortSel.value);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Render — called every time controls change
+// ---------------------------------------------------------------------------
+
+function render(data, degree, minDegree, sortBy) {
+
+  // ── 4a. Filter nodes by minimum degree ───────────────────────────────────
+  //
+  // We keep only nodes whose degree (total connections) >= minDegree.
+  // Then we keep only edges where BOTH endpoints survived the filter.
+
+  const activeIds = new Set(
+    data.nodes
+      .filter(n => (degree[n.id] || 0) >= minDegree)
+      .map(n => n.id)
+  );
+
+  const filteredNodes = data.nodes.filter(n => activeIds.has(n.id));
+  const filteredLinks = data.links.filter(
+    l => activeIds.has(l.source) && activeIds.has(l.target)
+  );
+
+  // Update stats counter
+  document.getElementById("stat-nodes").textContent = filteredNodes.length;
+  document.getElementById("stat-links").textContent = filteredLinks.length;
+
+  // Show/hide empty state
+  const empty  = document.getElementById("empty");
+  const wrapper= document.getElementById("diagram-wrapper");
+  if (filteredNodes.length === 0) {
+    empty.style.display  = "block";
+    wrapper.style.display= "none";
+    return;
+  }
+  empty.style.display  = "none";
+  wrapper.style.display= "block";
+
+  // ── 4b. Sort nodes ────────────────────────────────────────────────────────
+  //
+  // Three strategies:
+  //
+  //  "degree"    — Sort descending by degree.
+  //                Then interleave: highest-degree nodes go to the center
+  //                so the longest arcs span across the middle (cleaner look).
+  //
+  //  "ecosystem" — Group packages by their top-level group prefix.
+  //                All org.jetbrains packages together, all io.ktor together, etc.
+  //                Within each group, sort by degree descending.
+  //
+  //  "name"      — Alphabetical. Makes it easy to find a specific package.
+
+  let sorted;
+  if (sortBy === "degree") {
+    // Sort by degree descending, then interleave so hub is in center:
+    // [1st, 3rd, 5th, ... ...6th, 4th, 2nd]
+    const byDeg = [...filteredNodes].sort((a, b) => degree[b.id] - degree[a.id]);
+    const left  = byDeg.filter((_, i) => i % 2 === 0).reverse();
+    const right = byDeg.filter((_, i) => i % 2 !== 0);
+    sorted = [...left, ...right];
+
+  } else if (sortBy === "ecosystem") {
+    sorted = [...filteredNodes].sort((a, b) => {
+      const ea = getEcosystem(a.id);
+      const eb = getEcosystem(b.id);
+      if (ea !== eb) return ea.localeCompare(eb);
+      return degree[b.id] - degree[a.id];
+    });
+
+  } else { // name
+    sorted = [...filteredNodes].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  // ── 4c. Build x-scale ────────────────────────────────────────────────────
+  //
+  // d3.scalePoint maps each node ID to an x-coordinate.
+  // We compute the SVG width so nodes are always NODE_SPACING px apart.
+
+  const svgWidth = MARGIN.left + sorted.length * NODE_SPACING + MARGIN.right;
+
+  const xScale = d3.scalePoint()
+    .domain(sorted.map(n => n.id))
+    .range([MARGIN.left, svgWidth - MARGIN.right])
+    .padding(0.5);
+
+  // ── 4d. Set up SVG ────────────────────────────────────────────────────────
+
+  const svg = d3.select("#diagram")
+    .attr("width",  svgWidth)
+    .attr("height", SVG_HEIGHT);
+
+  // Clear previous render
+  svg.selectAll("*").remove();
+
+  // ── 4e. Build adjacency index (for hover interaction) ────────────────────
+  //
+  // For each node, store the set of its direct neighbors.
+  // Used to quickly identify which nodes/arcs to highlight on hover.
+
+  const neighbors = {};
+  sorted.forEach(n => { neighbors[n.id] = new Set(); });
+  filteredLinks.forEach(l => {
+    neighbors[l.source]?.add(l.target);
+    neighbors[l.target]?.add(l.source);
+  });
+
+  // ── 4f. Draw arcs ─────────────────────────────────────────────────────────
+  //
+  // Each edge is a quadratic Bézier curve with:
+  //   • start point  : (x1, BASELINE_Y)
+  //   • end point    : (x2, BASELINE_Y)
+  //   • control point: (midpoint_x, BASELINE_Y - arc_height)
+  //
+  // Arc height is proportional to the horizontal distance between the two nodes.
+  // This means long-range dependencies create tall arcs (visible across the diagram)
+  // while short-range dependencies stay low (near the baseline).
+  //
+  // All arcs go ABOVE the baseline (negative y offset from baseline).
+
+  function arcPath(sourceId, targetId) {
+    const x1 = xScale(sourceId);
+    const x2 = xScale(targetId);
+    const mx  = (x1 + x2) / 2;                        // midpoint x
+    const h   = Math.abs(x2 - x1) * ARC_SCALE;        // arc height
+    return `M${x1},${BASELINE_Y} Q${mx},${BASELINE_Y - h} ${x2},${BASELINE_Y}`;
+  }
+
+  const arcGroup = svg.append("g").attr("class", "arcs");
+
+  const arcs = arcGroup.selectAll("path.arc")
+    .data(filteredLinks, d => `${d.source}||${d.target}`)
+    .join("path")
+      .attr("class", "arc")
+      .attr("d",       d => arcPath(d.source, d.target))
+      .attr("stroke",  d => colorOf(d.source))         // color = source node's ecosystem
+      .attr("stroke-width", 1);
+
+  // ── 4g. Draw nodes ────────────────────────────────────────────────────────
+  //
+  // Nodes are circles on the baseline.
+  // Radius scales with degree: high-degree nodes get a larger circle.
+
+  const nodeGroup = svg.append("g").attr("class", "nodes");
+
+  const nodes = nodeGroup.selectAll("circle.node")
+    .data(sorted, d => d.id)
+    .join("circle")
+      .attr("class", "node")
+      .attr("cx",    d => xScale(d.id))
+      .attr("cy",    BASELINE_Y)
+      .attr("r",     d => degree[d.id] >= LABEL_THRESH ? NODE_R_LARGE : NODE_R)
+      .attr("fill",  d => colorOf(d.id))
+      .attr("stroke","#0d1117")
+      .attr("stroke-width", 1);
+
+  // ── 4h. Draw labels ───────────────────────────────────────────────────────
+  //
+  // Labels are rotated -60° so they don't overlap horizontally.
+  // Permanent labels: only shown for packages with degree >= LABEL_THRESH.
+  // All labels become visible on hover (via tooltip instead, see below).
+
+  const labelGroup = svg.append("g").attr("class", "labels");
+
+  const labels = labelGroup.selectAll("text.node-label")
+    .data(sorted, d => d.id)
+    .join("text")
+      .attr("class", d => `node-label${degree[d.id] >= LABEL_THRESH ? " prominent" : ""}`)
+      .attr("x",     d => xScale(d.id))
+      .attr("y",     BASELINE_Y + 8)
+      .attr("text-anchor", "end")
+      .attr("transform", d => {
+        const x = xScale(d.id);
+        return `rotate(-60, ${x}, ${BASELINE_Y + 8})`;
+      })
+      // Show only short names for permanent labels (artifact part after ":")
+      .text(d => {
+        if (degree[d.id] < LABEL_THRESH) return "";
+        const artifact = d.id.split(":")[1] || d.id;
+        return artifact.split("@")[0];          // strip version
+      });
+
+  // ── 4i. Hover interaction ────────────────────────────────────────────────
+  //
+  // On mouseover a node:
+  //   1. The hovered node and all its direct neighbors stay fully visible.
+  //   2. All other nodes and arcs are dimmed.
+  //   3. Arcs connected to the hovered node are highlighted.
+  //   4. A tooltip shows package details.
+
+  const tooltip = d3.select("#tooltip");
+
+  nodes
+    .on("mouseover", function(event, d) {
+      const nbrs = neighbors[d.id];
+
+      // Dim / highlight arcs
+      arcs.classed("dimmed",      l => l.source !== d.id && l.target !== d.id)
+          .classed("highlighted", l => l.source === d.id || l.target === d.id);
+
+      // Dim / keep nodes
+      nodes.classed("dimmed", n => n.id !== d.id && !nbrs.has(n.id));
+
+      // Dim labels
+      labels.classed("dimmed", n => n.id !== d.id && !nbrs.has(n.id));
+
+      // Tooltip content
+      const name    = d.id.split("@")[0];
+      const version = d.id.includes("@") ? d.id.split("@")[1] : "–";
+      const eco     = getEcosystem(d.id);
+      const deg     = degree[d.id];
+
+      tooltip
+        .style("opacity", 1)
+        .html(`
+          <div class="tip-name">${name}</div>
+          <div class="tip-version">v${version}</div>
+          <div class="tip-eco">${eco}</div>
+          <div class="tip-degree">⬡ ${deg} connections (${nbrs.size} direct neighbors)</div>
+        `);
+    })
+    .on("mousemove", function(event) {
+      // Follow the cursor with 12px offset to avoid overlap
+      const x = event.clientX + 14;
+      const y = event.clientY - 28;
+      tooltip
+        .style("left",  x + "px")
+        .style("top",   y + "px");
+    })
+    .on("mouseleave", function() {
+      // Reset all dimming
+      arcs.classed("dimmed", false).classed("highlighted", false);
+      nodes.classed("dimmed", false);
+      labels.classed("dimmed", false);
+      tooltip.style("opacity", 0);
+    });
+}
+</script>
+
+</body>
+</html>
