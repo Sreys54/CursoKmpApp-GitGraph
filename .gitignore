@@ -18,5 +18,6 @@ captures
 
 # SBOM pipeline
 pipeline/sbom/sbom.json
-pipeline/sbom/graph.json
 pipeline/sbom/.env
+# graph.json se commitea para que GitHub Pages pueda servirlo al diagrama
+# pipeline/sbom/graph.json
