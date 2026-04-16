@@ -1,0 +1,85 @@
+# =============================================================================
+# Deploy Arc Diagram to GitHub Pages
+# =============================================================================
+#
+# Publishes the arc diagram visualization to GitHub Pages whenever the
+# visualization or the dependency graph changes on the main branch.
+#
+# The deployed site is served from the pipeline/ directory, so the URL layout
+# mirrors the local file layout:
+#
+#   Local:   pipeline/visualization/arc_diagram.html
+#   Live:    https://{owner}.github.io/{repo}/visualization/arc_diagram.html
+#
+#   Local:   pipeline/sbom/graph.json          (loaded by the diagram)
+#   Live:    https://{owner}.github.io/{repo}/sbom/graph.json
+#
+# The CI dependency-analysis workflow links directly to the live diagram with
+# a ?focus=<packageName> query parameter so the reviewer lands on the changed
+# library's focus view without any manual interaction.
+#
+# Permissions required:
+#   pages: write       — deploy to GitHub Pages
+#   id-token: write    — authenticate the Pages deployment (OIDC)
+#   contents: read     — checkout
+#
+# To enable GitHub Pages for this repo:
+#   Settings → Pages → Source → "GitHub Actions"
+# =============================================================================
+
+name: Deploy Arc Diagram to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pipeline/visualization/**'
+      - 'pipeline/sbom/graph.json'
+  # Allow manual re-deployment from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment runs at a time; in-flight runs are NOT cancelled so
+# a deployment always completes rather than being interrupted mid-push.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy visualization to GitHub Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Configure Pages ──────────────────────────────────────────────────
+      # Reads the Pages configuration for this repository and validates that
+      # Pages is enabled with the "GitHub Actions" source.
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # ── 3. Upload artifact ──────────────────────────────────────────────────
+      # Packages the pipeline/ directory as the Pages artifact.
+      # The directory contains:
+      #   visualization/arc_diagram.html  — the interactive D3 diagram
+      #   sbom/graph.json                 — the dependency graph data
+      #   sbom/sbom.json                  — the raw SPDX SBOM
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pipeline/
+
+      # ── 4. Deploy ────────────────────────────────────────────────────────────
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

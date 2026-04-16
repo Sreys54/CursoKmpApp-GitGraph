@@ -1,0 +1,176 @@
+# =============================================================================
+# Dependency Analysis Pipeline
+# =============================================================================
+#
+# This workflow runs automatically on every Pull Request that targets the main
+# branch.  It detects which dependencies changed, runs the full SBOM pipeline,
+# computes the in-project impact of each change, and posts a structured report
+# as a PR comment — including a Mermaid subgraph that mirrors the arc diagram's
+# focus mode for the most-impacted library.
+#
+# Pipeline steps:
+#   1. get_diff.js       — GitHub Comparison API  →  diff.json
+#   2. fetch_sbom.js     — GitHub SBOM API        →  sbom.json   (existing)
+#   3. transform_sbom.js — sbom.json              →  graph.json  (existing)
+#   4. analyze_impact.js — graph.json + diff.json →  report.json
+#   5. actions/github-script — report.json        →  PR comment
+#
+# Permissions required:
+#   contents: read        — checkout + SBOM API
+#   pull-requests: write  — post / update the PR comment
+# =============================================================================
+
+name: Dependency Analysis Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze-dependencies:
+    name: Analyze dependency changes
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Node.js runtime ──────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── 3. Detect what changed ──────────────────────────────────────────────
+      #
+      # Calls the GitHub Dependency Graph Comparison API:
+      #   GET /repos/{owner}/{repo}/dependency-graph/compare/{base}...{head}
+      #
+      # Produces pipeline/ci/diff.json with:
+      #   { added: [...], removed: [...], updated: [...], totalChanges: N }
+      #
+      # Exit code 0 in all cases — even when there are no changes.
+      - name: Detect dependency changes
+        id: detect
+        run: node pipeline/ci/get_diff.js
+        env:
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER:  ${{ github.repository_owner }}
+          GITHUB_REPO:   ${{ github.event.repository.name }}
+          BASE_SHA:      ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:      ${{ github.event.pull_request.head.sha }}
+          DIFF_OUT_PATH: pipeline/ci/diff.json
+
+      # ── 4. Read change count from diff.json ─────────────────────────────────
+      - name: Check whether any dependencies changed
+        id: check
+        run: |
+          CHANGES=$(node -e "
+            const d = require('./pipeline/ci/diff.json');
+            console.log(d.totalChanges);
+          ")
+          echo "total_changes=$CHANGES" >> "$GITHUB_OUTPUT"
+          echo "[INFO] Dependencies changed: $CHANGES"
+
+      # ── 5. Fetch SBOM (only if there are changes) ───────────────────────────
+      #
+      # Fetches the current SBOM of the repository's default branch.
+      # This reflects the project's known dependency graph before the PR is
+      # merged — used to compute who already depends on each changed library.
+      - name: Fetch SBOM
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/sbom/fetch_sbom.js
+        env:
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER:     ${{ github.repository_owner }}
+          GITHUB_REPO:      ${{ github.event.repository.name }}
+          SBOM_OUTPUT_PATH: pipeline/sbom/sbom.json
+
+      # ── 6. Transform SBOM → graph.json ──────────────────────────────────────
+      - name: Transform SBOM to graph
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/sbom/transform_sbom.js
+        env:
+          SBOM_INPUT_PATH:   pipeline/sbom/sbom.json
+          GRAPH_OUTPUT_PATH: pipeline/sbom/graph.json
+
+      # ── 7. Analyze impact ───────────────────────────────────────────────────
+      #
+      # For each changed package, queries graph.json to find how many nodes
+      # in the project depend on it (in-degree of the changed node).
+      # Generates a Mermaid subgraph and computes a criticality level.
+      # Produces pipeline/ci/report.json containing the full markdown comment.
+      - name: Analyze impact
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/ci/analyze_impact.js
+        env:
+          GRAPH_PATH:     pipeline/sbom/graph.json
+          DIFF_PATH:      pipeline/ci/diff.json
+          REPORT_PATH:    pipeline/ci/report.json
+          # Base URL of the GitHub Pages deployment — used to generate a
+          # deep-link in the PR comment that opens the arc diagram with the
+          # changed library pre-selected in focus mode.
+          PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+
+      # ── 8. Post / update PR comment ─────────────────────────────────────────
+      #
+      # Reads report.json and posts the markdown as a PR comment.
+      # If a comment from a previous run already exists (identified by the
+      # HTML marker <!-- dependency-analysis-bot -->), it is updated in place
+      # rather than creating a duplicate comment on each push.
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        env:
+          TOTAL_CHANGES: ${{ steps.check.outputs.total_changes }}
+        with:
+          script: |
+            const fs = require('fs');
+            const totalChanges = parseInt(process.env.TOTAL_CHANGES || '0');
+
+            // Build the comment body
+            let body;
+            if (totalChanges > 0 && fs.existsSync('pipeline/ci/report.json')) {
+              const report = JSON.parse(fs.readFileSync('pipeline/ci/report.json', 'utf-8'));
+              body = report.markdown;
+            } else {
+              body = [
+                '<!-- dependency-analysis-bot -->',
+                '## 🔍 Análisis de Dependencias',
+                '',
+                '✅ No se detectaron cambios en las dependencias de este PR.',
+                '',
+                `> 🤖 Pipeline ejecutado automáticamente · Commit: \`${context.sha.slice(0, 7)}\``,
+              ].join('\n');
+            }
+
+            // Find an existing bot comment to update instead of duplicating
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(
+              c => c.body && c.body.includes('<!-- dependency-analysis-bot -->')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: existing.id,
+                body,
+              });
+              console.log(`Updated existing bot comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              console.log('Created new bot comment');
+            }

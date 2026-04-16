@@ -829,3 +829,487 @@ arc_diagram.html
 | Arc height ∝ horizontal distance | Long-range dependencies (between nodes far apart on the baseline) rise to large heights, making cross-cluster dependencies visually prominent |
 | Interleaved degree sort (hub in center) | Placing the most-connected node at the center distributes its arcs symmetrically left and right, producing a cleaner visual than placing it at one edge |
 | Quadratic Bézier arcs (not SVG arc elements) | Simpler parametric formula; arc height is a direct function of node distance; easier to reason about than SVG arc commands |
+
+---
+
+## Step 4 — GitHub Actions CI Integration
+
+### Why automate the pipeline?
+
+Steps 1–3 produce a point-in-time snapshot: run the scripts manually, get the graph, explore it in the browser. This is useful for one-off analysis but misses the moment when dependency changes actually happen — when a developer opens a Pull Request that updates a library version or adds a new dependency. Automating the pipeline against every PR turns it from an exploratory tool into a continuous guardrail: every change is analyzed the moment it is proposed, and the impact report appears inline in the PR before the merge decision is made.
+
+### What the CI pipeline does
+
+When a Pull Request is opened or updated against `main`, a GitHub Actions workflow:
+
+1. Calls the **GitHub Dependency Graph Comparison API** to detect exactly which packages were added, removed, or updated between the base commit and the PR head
+2. Fetches the **current SBOM** of the repository (the state of the default branch)
+3. **Transforms** it to `graph.json` using the existing `transform_sbom.js` script — no changes required
+4. **Analyzes the impact** of each changed package: how many nodes in the project currently depend on it, who they are, and how critical the change is
+5. **Posts a structured Markdown comment** on the PR with tables of changes and a Mermaid subgraph for the most impacted library
+
+If the workflow runs again on the same PR (because of a new push), it **updates the existing comment** instead of creating a duplicate.
+
+---
+
+### The GitHub Dependency Graph Comparison API
+
+The central technical insight of the CI integration is that GitHub provides a dedicated API endpoint for exactly this use case:
+
+```
+GET /repos/{owner}/{repo}/dependency-graph/compare/{base}...{head}
+```
+
+where `{base}` and `{head}` are full commit SHAs. This endpoint returns the **diff** of the dependency graph between two commits — the packages that were added or removed in the manifest files modified by the PR. Each item in the response includes:
+
+| Field | Description |
+|---|---|
+| `change_type` | `"added"` or `"removed"` |
+| `name` | Maven `group:artifact` (no version) |
+| `version` | The resolved version string |
+| `manifest` | The file that declared it (`composeApp/build.gradle.kts`, etc.) |
+| `ecosystem` | Package ecosystem (`"Maven"`, `"pip"`, etc.) |
+| `package_url` | Package URL (purl) |
+| `vulnerabilities` | Known CVEs if GitHub Advanced Security is enabled |
+
+A **version update** (e.g. `kotlin-stdlib` going from `1.9.22` to `1.9.23`) appears as one `"removed"` entry for the old version plus one `"added"` entry for the new version with the same `name`. The `get_diff.js` script detects and collapses these pairs into a single `"updated"` entry.
+
+The `GITHUB_TOKEN` that GitHub Actions injects automatically into every workflow already has `dependency_graph: read` permission — no Personal Access Token is required for CI.
+
+---
+
+### Why the SBOM is fetched for the default branch (not the PR branch)
+
+The GitHub SBOM API (`/dependency-graph/sbom`) only exposes the dependency graph for the repository's **default branch**. It does not accept a ref or SHA parameter. This is a GitHub API limitation.
+
+This means the `graph.json` used for impact analysis reflects the **state of main before the PR is merged**, not the state after. The implications are:
+
+| Change type | In graph.json? | Impact analysis |
+|---|---|---|
+| **Updated** dependency | ✅ Yes (old version) | Can find all current dependents — full analysis |
+| **Added** dependency | ❌ No (not in main yet) | Reported as "new addition" with no dependents |
+| **Removed** dependency | ✅ Yes | Reported with a warning to check for direct references |
+
+This is actually the correct behavior for a pre-merge guardrail. The question being answered is: **"given that this library is changing, how many packages in the project as it exists today will be affected?"**
+
+---
+
+### Dependency direction in impact analysis
+
+The direction convention is the same as in the visualization:
+
+```
+source → target  means  "source DEPENDS_ON target"
+```
+
+When a library X is modified, the affected packages are those where `link.target === X` — the sources that depend on X. `analyze_impact.js` finds these incoming dependents and counts them to determine criticality:
+
+```javascript
+graph.links.forEach(l => {
+  if (matchingIds.has(l.target)) {
+    dependentSet.add(l.source);   // l.source depends on the changed package
+  }
+});
+```
+
+This mirrors exactly the arc diagram's focus mode: selecting a library highlights its incoming arcs (who depends on it), which is the analytically relevant direction for impact assessment.
+
+---
+
+### Criticality levels
+
+| Level | Threshold | Meaning |
+|---|---|---|
+| 🔴 CRÍTICO | ≥ 50 dependents | Core infrastructure — almost everything uses this package; a breaking change cascades through most of the project |
+| 🟠 ALTO | 15 – 49 dependents | Important shared library — many modules affected |
+| 🟡 MEDIO | 5 – 14 dependents | Moderately shared — several modules affected |
+| 🟢 BAJO | < 5 dependents | Leaf or lightly used — limited blast radius |
+
+---
+
+### The Mermaid subgraph
+
+GitHub renders [Mermaid diagrams](https://github.blog/2022-02-14-include-diagrams-markdown-files-mermaid/) natively in Markdown since February 2022. This is the key capability that enables a visual graph directly inside a PR comment without any image hosting or headless browser rendering.
+
+The generated Mermaid diagram mirrors the arc diagram's focus mode:
+
+- Arrows point **to** the changed library (incoming arcs = dependents)
+- The changed library is highlighted in blue (`#388bfd` — the same color used in the visualization)
+- At most 12 direct dependents are shown; if there are more, a summary node `"... +N más"` is appended
+
+```
+```mermaid
+graph LR
+    classDef changed fill:#388bfd,color:#fff,stroke:#79c0ff,stroke-width:2px
+
+    N0["ktor-client-core"] --> TARGET["kotlin-stdlib ⬆️"]
+    N1["CursoKmpApp-GitGraph"] --> TARGET
+    N2["atomicfu"] --> TARGET
+    N3["kotlinx-coroutines-core"] --> TARGET
+    MORE["... +99 más"] --> TARGET
+    class TARGET changed
+```
+```
+
+The arc diagram cannot be embedded in a PR comment because it requires a browser to execute JavaScript. Mermaid is the closest equivalent that renders natively in GitHub Markdown.
+
+---
+
+### Files
+
+```
+.github/workflows/
+└── dependency-analysis.yml   — the full CI workflow
+
+pipeline/ci/
+├── get_diff.js               — Step 1 CI: Comparison API → diff.json
+└── analyze_impact.js         — Step 2 CI: graph.json + diff.json → report.json
+
+pipeline/sbom/
+├── fetch_sbom.js             — Step 1 original: SBOM API → sbom.json  (reused unchanged)
+└── transform_sbom.js         — Step 2 original: sbom.json → graph.json (reused unchanged)
+```
+
+The existing `fetch_sbom.js` and `transform_sbom.js` scripts from Steps 1–2 are reused **without any modification**. This was possible because they were designed with configurable input/output paths via environment variables and no hard-coded assumptions about the execution environment.
+
+---
+
+### Workflow file annotated
+
+```yaml
+name: Dependency Analysis Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]   # runs on every push to the PR
+
+permissions:
+  contents: read        # needed for checkout and SBOM API
+  pull-requests: write  # needed to post/update the PR comment
+
+jobs:
+  analyze-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── Step 1: detect what changed ────────────────────────────────────────
+      # Calls /dependency-graph/compare/{base}...{head}
+      # Writes pipeline/ci/diff.json
+      # Exit code 0 even when totalChanges === 0 (no changes = no problem)
+      - name: Detect dependency changes
+        run: node pipeline/ci/get_diff.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA:     ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:     ${{ github.event.pull_request.head.sha }}
+
+      # ── Step 2: read total_changes from diff.json ──────────────────────────
+      # Used as a condition to skip SBOM fetch and analysis when there are no
+      # dependency changes (saves API quota and CI time)
+      - name: Check whether any dependencies changed
+        id: check
+        run: |
+          CHANGES=$(node -e "console.log(require('./pipeline/ci/diff.json').totalChanges)")
+          echo "total_changes=$CHANGES" >> "$GITHUB_OUTPUT"
+
+      # ── Step 3: fetch SBOM (skipped if no changes) ────────────────────────
+      - name: Fetch SBOM
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/sbom/fetch_sbom.js
+        env:
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
+          SBOM_OUTPUT_PATH: pipeline/sbom/sbom.json
+
+      # ── Step 4: transform → graph.json ───────────────────────────────────
+      - name: Transform SBOM to graph
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/sbom/transform_sbom.js
+        env:
+          SBOM_INPUT_PATH:   pipeline/sbom/sbom.json
+          GRAPH_OUTPUT_PATH: pipeline/sbom/graph.json
+
+      # ── Step 5: analyze impact ────────────────────────────────────────────
+      - name: Analyze impact
+        if: steps.check.outputs.total_changes != '0'
+        run: node pipeline/ci/analyze_impact.js
+        env:
+          GRAPH_PATH:  pipeline/sbom/graph.json
+          DIFF_PATH:   pipeline/ci/diff.json
+          REPORT_PATH: pipeline/ci/report.json
+
+      # ── Step 6: post/update PR comment ────────────────────────────────────
+      # Always runs — posts "no changes" if nothing was detected
+      # Finds existing bot comment by the <!-- dependency-analysis-bot --> marker
+      # and updates it instead of creating duplicates on subsequent pushes
+      - name: Post PR comment
+        uses: actions/github-script@v7
+```
+
+---
+
+### `get_diff.js` — what each part does
+
+| Section | Purpose |
+|---|---|
+| `validate()` | Checks all 5 required env vars before making any network call; exits with a clear message listing which are missing |
+| `httpGet(url)` | Authenticated HTTPS GET with 30 s timeout; no npm dependencies |
+| Rate-limit logging | Logs `X-RateLimit-Remaining` and reset time on every run — visible in CI logs before throttling becomes a problem |
+| HTTP status checks | Specific guidance for 404 (Dependency Graph feature may be disabled) and 403 (token permissions) |
+| Pair detection | Identifies version updates by matching `"added"` and `"removed"` entries with the same `name`; collapses them into a single `"updated"` entry |
+| `normalise(dep)` | Extracts only the fields needed downstream, discarding raw API noise |
+
+---
+
+### `analyze_impact.js` — what each part does
+
+| Section | Purpose |
+|---|---|
+| `analyzeOne(graph, name, label)` | Finds all graph nodes matching the changed package (prefix match to handle multiple resolved versions), then collects all sources whose `link.target` is one of those nodes |
+| `criticality(count)` | Maps dependent count to a criticality level and emoji using fixed thresholds |
+| Mermaid subgraph builder | Generates a `graph LR` diagram with the changed node highlighted via `classDef`; caps at `MAX_MERMAID_DEPS` (12) dependents to keep the diagram readable |
+| `buildMarkdown(diff, impacts)` | Assembles the full PR comment: summary line → tables by change type → Mermaid subgraphs for top 2 high-impact changes → footer |
+| `<!-- dependency-analysis-bot -->` marker | HTML comment on the first line; the workflow uses this to find the existing comment and update it rather than appending a new one on every push |
+
+---
+
+### PR comment structure
+
+The generated comment follows this structure:
+
+```
+## 🔍 Análisis de Dependencias
+
+Se detectaron 2 cambios en las dependencias de este PR.
+
+### ⬆️ Actualizadas
+| Paquete              | Versión anterior | Nueva versión | Impacto          |
+|----------------------|-----------------|---------------|------------------|
+| kotlin-stdlib        | 1.9.22           | 1.9.23        | 🔴 103 paquetes  |
+| kotlinx-coroutines   | 1.8.0            | 1.8.1         | 🟠 89 paquetes   |
+
+---
+
+### 📊 Subgrafo de impacto
+
+#### `kotlin-stdlib` — 🔴 103 dependientes directos (actualizada) · [🔗 Ver en diagrama interactivo](https://sreys54.github.io/CursoKmpApp-GitGraph/visualization/arc_diagram.html?focus=org.jetbrains.kotlin:kotlin-stdlib)
+
+[Mermaid diagram — arrows point to kotlin-stdlib]
+
+---
+
+> 🤖 Pipeline ejecutado automáticamente · Commit: `a3f7c12`
+```
+
+---
+
+### Example output — `get_diff.js`
+
+```
+[INFO] Comparing dependencies: a3f7c12 → 9d2e8b1
+[INFO] GET https://api.github.com/repos/Sreys54/CursoKmpApp-GitGraph/dependency-graph/compare/a3f7c12...9d2e8b1
+[INFO] Rate limit — remaining: 4997, resets: 2026-04-15T03:00:00.000Z
+[INFO] Diff saved to: pipeline/ci/diff.json
+[INFO]   ➕ Added:   0
+[INFO]   ➖ Removed: 0
+[INFO]   ⬆️  Updated: 2
+[INFO]   Total:    2
+```
+
+### Example output — `analyze_impact.js`
+
+```
+[INFO] Graph: 611 nodes, 3037 links
+[INFO] Diff:  +0 added, -0 removed, ~2 updated
+[INFO] org.jetbrains.kotlin:kotlin-stdlib: 103 dependents [CRÍTICO]
+[INFO] org.jetbrains.kotlinx:kotlinx-coroutines-core: 89 dependents [CRÍTICO]
+[INFO] Report saved to: pipeline/ci/report.json
+```
+
+---
+
+### Design Decisions — Step 4
+
+| Decision | Reason |
+|---|---|
+| Trigger: `pull_request` (not `push`) | Dependency analysis is most useful before a change is merged, not after. The PR context also provides `issue_number` needed to post comments. |
+| No `paths` filter on the workflow | A `paths` filter limited to `*.gradle.kts` would miss Dependabot PRs that modify lockfiles or other manifests. Running on every PR and detecting zero changes is cheaper than missing a real dependency update. |
+| Comparison API instead of diffing two full SBOMs | The comparison API returns exactly the dependency diff in one call. Fetching two full SBOMs (base + head) would require the head SBOM to exist on the default branch — which it does not until the PR is merged. |
+| SBOM from default branch (not PR head) | The SBOM API only exposes the default branch. This is intentional: impact analysis answers "who in the current project depends on X?" not "who will depend on X after merge?" |
+| Update existing comment instead of creating new one | Without update logic, each push to the PR appends a new bot comment. With 5+ pushes this clutters the PR timeline. The `<!-- dependency-analysis-bot -->` marker makes the existing comment findable by ID. |
+| Mermaid instead of the arc diagram HTML | The arc diagram requires a browser with JavaScript and cannot be embedded in a Markdown comment. Mermaid renders natively in GitHub Markdown since February 2022 and can represent the same incoming-arc subgraph. |
+| Cap Mermaid at 12 dependents | Mermaid diagrams with more than ~15–20 nodes become unreadable in the PR comment column width. The `"... +N más"` summary node communicates the full scale without sacrificing readability. |
+| Show top 2 subgraphs maximum | A PR comment with 5+ Mermaid diagrams is scroll-heavy and loses focus. The two most-impacted changes are the most actionable; the rest are covered by the summary table. |
+| Reuse `fetch_sbom.js` and `transform_sbom.js` unchanged | These scripts were designed with environment-variable-based paths from the start. Zero code changes needed to run them in CI — the pipeline modularity pays off here. |
+| Exit code 0 from `get_diff.js` when no changes | An exit code 1 would cause the workflow job to fail, which would block the PR. "No dependency changes" is a valid and expected outcome, not an error. |
+| `GITHUB_TOKEN` only — no PAT required | The `dependency_graph: read` permission is included in the default `GITHUB_TOKEN` that Actions injects automatically. Requiring a separately managed PAT would add operational complexity for no security benefit. |
+| Deep-link to arc diagram via `?focus=` | The Mermaid subgraph is compact but static. The link to the live diagram lets the reviewer drill into the full interactive graph with focus mode pre-activated, without having to find the library manually. |
+
+---
+
+## Step 5 — GitHub Pages Deployment and Deep Linking
+
+### Why publish the arc diagram publicly?
+
+Steps 1–4 produce a PR comment that is entirely self-contained: tables, criticality labels, and a Mermaid subgraph all render inline in GitHub. This is sufficient for a quick review. However, the static Mermaid diagram has hard limits — it shows at most 12 dependents and cannot be interacted with. When a library has 103 dependents, the reviewer sees `"... +91 más"` and has no way to explore the full picture without running the pipeline locally.
+
+Publishing the arc diagram to **GitHub Pages** solves this: the full interactive visualization is available at a stable public URL, and the PR comment can link directly to it. Because the arc diagram now supports a `?focus=` query parameter, the link opens the diagram with the changed library already selected in focus mode — the reviewer lands on the exact view they need with zero manual interaction.
+
+### How GitHub Pages deployment works
+
+GitHub Pages is GitHub's static site hosting service. Any repository can publish a directory of static files (HTML, JSON, CSS, JavaScript) to `https://{owner}.github.io/{repo}/` at no cost. The arc diagram is a single HTML file that loads `graph.json` via a relative `fetch()` call — no server-side logic is required, making it a perfect fit for static hosting.
+
+The deployment is performed by a dedicated GitHub Actions workflow (`.github/workflows/deploy-pages.yml`) that triggers automatically whenever files in `pipeline/visualization/` or `pipeline/sbom/graph.json` change on the `main` branch. This ensures the public diagram always reflects the committed dependency graph.
+
+```
+push to main
+(visualization/ or graph.json changed)
+         │
+         ▼
+  actions/checkout@v4
+         │
+         ▼
+  actions/configure-pages@v5
+  (validates Pages is enabled)
+         │
+         ▼
+  actions/upload-pages-artifact@v3
+  (packages the pipeline/ directory)
+         │
+         ▼
+  actions/deploy-pages@v4
+  (publishes to GitHub Pages CDN)
+         │
+         ▼
+  https://sreys54.github.io/CursoKmpApp-GitGraph/
+  visualization/arc_diagram.html   ← live diagram
+  sbom/graph.json                  ← data loaded by diagram
+```
+
+The `pipeline/` directory is used as the Pages root because the arc diagram already references `../sbom/graph.json` relative to its own location (`pipeline/visualization/`). Under Pages, that path becomes `/sbom/graph.json` — no changes to the HTML file are needed.
+
+### The `deploy-pages.yml` workflow
+
+```yaml
+name: Deploy Arc Diagram to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pipeline/visualization/**'
+      - 'pipeline/sbom/graph.json'
+  workflow_dispatch:                    # manual re-deploy from Actions tab
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write                       # required for OIDC authentication
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false             # never interrupt a deployment mid-push
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pipeline/               # serve this directory as the site root
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+Key design details:
+
+- **`paths` filter** — The workflow only triggers when `pipeline/visualization/` or `pipeline/sbom/graph.json` changes. A README edit or a source code change does not cause an unnecessary re-deployment.
+- **`workflow_dispatch`** — Allows a manual re-deployment from the Actions tab, which is useful immediately after enabling Pages for the first time.
+- **`cancel-in-progress: false`** — A deployment that is interrupted mid-run can leave the Pages site in a broken state. Completing each deployment is safer than cancelling it for a newer push.
+- **`id-token: write`** — GitHub Pages deployments authenticate via OIDC rather than a Personal Access Token. This permission grants the short-lived identity token needed to deploy.
+
+### The `?focus=` deep-link mechanism
+
+The arc diagram's `boot()` function — which runs once after `graph.json` has loaded — now includes a URL parameter handler added after the initial render:
+
+```javascript
+// ── 4h. Handle ?focus= URL parameter ────────────────────────────────────
+const urlParams  = new URLSearchParams(window.location.search);
+const focusParam = urlParams.get("focus");
+if (focusParam) {
+  const match = data.nodes.find(n =>
+    n.id === focusParam || n.id.startsWith(focusParam + "@")
+  );
+  if (match) {
+    onLibClick(match.id);   // activates focus mode exactly as a user click would
+  }
+}
+```
+
+The matching strategy is intentionally prefix-based: the `?focus=` value is always the **versionless** package name (e.g., `org.jetbrains.kotlin:kotlin-stdlib`), while node IDs in the graph include the version (e.g., `org.jetbrains.kotlin:kotlin-stdlib@1.9.23`). The `startsWith(focusParam + "@")` check handles this transparently and also covers multi-version scenarios where the same library appears at two different versions (common in KMP projects).
+
+Calling `onLibClick(match.id)` is identical to the user clicking the library in the sidebar — it sets `selectedNode`, activates the selection chip, highlights the relevant sidebar entry, and re-renders the diagram in focus mode showing all incoming arcs (who depends on the selected library).
+
+### How `analyze_impact.js` generates the link
+
+The CI script constructs the deep-link URL using two inputs:
+
+1. **`PAGES_BASE_URL`** — the GitHub Pages base URL, passed by the workflow as an environment variable using `github.repository_owner` and `github.event.repository.name`:
+   ```yaml
+   PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+   ```
+
+2. **The package name** — URL-encoded with `encodeURIComponent()` so that characters like `:` are safely transmitted in the query string. The browser and `URLSearchParams` decode it back to the original string before matching.
+
+```javascript
+const diagramUrl = PAGES_BASE_URL
+  ? `${PAGES_BASE_URL}/visualization/arc_diagram.html` +
+    `?focus=${encodeURIComponent(changedName)}`
+  : null;
+```
+
+If `PAGES_BASE_URL` is empty (e.g., a local run without Pages configured), `diagramUrl` is `null` and the link is simply omitted from the markdown — the comment degrades gracefully to its Mermaid-only form.
+
+The link appears in the PR comment as part of the Mermaid subgraph heading:
+
+```
+#### `org.jetbrains.kotlin:kotlin-stdlib` — 🔴 103 dependientes directos
+(actualizada) · [🔗 Ver en diagrama interactivo](https://sreys54.github.io/...)
+```
+
+### Enabling GitHub Pages for this repository
+
+Before the workflow can deploy, Pages must be configured to use the "GitHub Actions" source:
+
+1. Go to **Settings → Pages** in the repository
+2. Under **Source**, select **GitHub Actions**
+3. Push any change to `pipeline/visualization/` or `pipeline/sbom/graph.json` on `main`, or trigger the workflow manually from the **Actions** tab
+
+The first successful deployment makes the diagram available at:
+
+```
+https://sreys54.github.io/CursoKmpApp-GitGraph/visualization/arc_diagram.html
+```
+
+### Design Decisions — Step 5
+
+| Decision | Reason |
+|---|---|
+| Separate `deploy-pages.yml` from `dependency-analysis.yml` | Deployment and CI analysis are independent concerns with different triggers and permissions. Merging them into one workflow would deploy on every PR (not just main pushes) and would require `pages: write` permission on a PR-triggered workflow, which is a wider attack surface. |
+| Serve `pipeline/` as the Pages root | The arc diagram uses a relative path (`../sbom/graph.json`) to load its data. Serving `pipeline/` as the root preserves this relative path without any modification to the HTML file. |
+| `paths` filter restricts deployment to visualization changes | Deploying on every push to main — regardless of what changed — wastes deployment quota and makes the Pages deployment history noisy. Only changes to the diagram or the graph data actually change what the deployed site shows. |
+| Versionless package name in `?focus=` | Node IDs in the graph include the version (`kotlin-stdlib@1.9.23`) but the diff API returns only the package name (`org.jetbrains.kotlin:kotlin-stdlib`). Using the versionless name future-proofs the link: it still works after a version update, and it handles multi-version KMP nodes by matching the first occurrence. |
+| `encodeURIComponent()` for the URL | Package names contain `:` (group separator) which is a valid but potentially confusing character in URLs. Encoding it to `%3A` ensures safe transmission across redirects and HTTP intermediaries. `URLSearchParams.get()` decodes it back to `:` transparently on the receiving end. |
+| Graceful degradation when `PAGES_BASE_URL` is unset | Local runs of `analyze_impact.js` do not have a Pages URL. Setting `diagramUrl = null` and omitting the link from the markdown means the script still produces a valid, useful PR comment in all environments. |
+| `cancel-in-progress: false` in concurrency group | A Pages deployment that is cancelled mid-run can leave the CDN serving a partial or inconsistent set of files. Completing the current deployment before starting a newer one is safer. |
